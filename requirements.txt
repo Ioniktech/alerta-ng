@@ -9,7 +9,7 @@ mohawk==1.1.0
 psycopg2==2.9.11
 PyJWT==2.12.1
 pymongo==4.16.0
-pyparsing==3.3.2
+pyparsing==3.3.3
 python-dateutil==2.9.0.post0
 pytz==2026.1.post1
 PyYAML==6.0.3
