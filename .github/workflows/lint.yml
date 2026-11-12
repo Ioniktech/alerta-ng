@@ -7,11 +7,13 @@ on:
 
 jobs:
   lint:
+    # Linting does not depend on the package's minimum supported version, so
+    # this tracks ubuntu-latest. Python 3.9 lives in tests.yml, on ubuntu-24.04.
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
-        python-version: ['3.9', '3.11']
+        python-version: ['3.11', '3.12']
 
     steps:
       - uses: actions/checkout@v4
