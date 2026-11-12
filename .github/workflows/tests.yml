@@ -7,7 +7,9 @@ on:
 
 jobs:
   test-postgres13:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 build,
+    # and setup.py still declares python_requires='>=3.9'.
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
@@ -48,7 +50,9 @@ jobs:
           pytest --cov=alerta tests/*.py
 
   test-postgres16:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 build,
+    # and setup.py still declares python_requires='>=3.9'.
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
@@ -89,7 +93,9 @@ jobs:
           pytest --cov=alerta tests/*.py
 
   test-mongodb60:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 build,
+    # and setup.py still declares python_requires='>=3.9'.
+    runs-on: ubuntu-24.04
 
     services:
       mongodb:
@@ -121,7 +127,9 @@ jobs:
           pytest --cov=alerta tests/*.py
 
   test-mongodb70:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 build,
+    # and setup.py still declares python_requires='>=3.9'.
+    runs-on: ubuntu-24.04
 
     services:
       mongodb:
@@ -153,7 +161,9 @@ jobs:
           pytest --cov=alerta tests/*.py
 
   test-integration:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 build,
+    # and setup.py still declares python_requires='>=3.9'.
+    runs-on: ubuntu-24.04
 
     services:
       mongodb:
