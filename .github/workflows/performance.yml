@@ -5,6 +5,9 @@ on:
     branches: [ main, release/* ]
     tags: [ '**' ]
 
+permissions:
+  contents: read
+
 jobs:
   load-test:
     runs-on: ubuntu-latest
@@ -23,24 +26,48 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-      alerta:
-        image: ghcr.io/${{ github.repository_owner }}/alerta-api:latest
-        credentials:
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-        ports:
-          - 8080:8080
-        env:
-          DEBUG: 1
-          DATABASE_URL: postgres://postgres:postgres@postgres:5432/alerta
-        options: >-
-          --health-cmd "curl --fail http://localhost:8080/_ || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-          --health-start-period 30s
 
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        run: echo "RELEASE=$(cut -d "'" -f 2 alerta/version.py)" >> "$GITHUB_ENV"
+
+      # Built here rather than pulled from GHCR: the image is only published
+      # from v* tags, and a pulled :latest would measure a previous build.
+      - name: Build image
+        run: >-
+          docker build
+          --build-arg BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          --build-arg BUILD_NUMBER=${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}
+          --build-arg RELEASE=$RELEASE
+          --build-arg VERSION=${{ github.sha }}
+          -t alerta-api:perf .
+
+      - name: Start API
+        run: >-
+          docker run -d --name alerta-api
+          --network host
+          -e DEBUG=1
+          -e DATABASE_URL=postgres://postgres:postgres@localhost:5432/alerta
+          alerta-api:perf
+
+      - name: Wait for API
+        run: |
+          for i in $(seq 1 60); do
+            if curl --fail --silent --output /dev/null http://localhost:8080/_; then
+              echo "API up after ${i}s"
+              exit 0
+            fi
+            if [ -z "$(docker ps -q -f name=alerta-api -f status=running)" ]; then
+              echo "::error::API container exited before becoming healthy"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::API did not become healthy within 60s"
+          exit 1
+
       - name: Perf test
         run: >-
           docker run
@@ -51,3 +78,7 @@ jobs:
           -T application/json
           -d '{"environment":"Production","service":["network"],"resource":"router01","event":"node_down"}'
           http://localhost:8080/alert
+
+      - name: API logs
+        if: always()
+        run: docker logs alerta-api || true
