@@ -128,10 +128,13 @@ def switchboard():
 @cross_origin()
 def good_to_go():
 
-    if db.is_alive:
-        return 'OK'
-    else:
+    if not db.is_alive:
         return 'FAILED', 503
+    # a down read replica costs the offload, not availability: the primary still serves every
+    # request, so report it without failing the probe and pulling a healthy node out of rotation
+    if not db.is_replica_alive:
+        return 'OK REPLICA_DOWN'
+    return 'OK'
 
 
 @mgmt.route('/management/healthcheck', methods=['OPTIONS', 'GET'])

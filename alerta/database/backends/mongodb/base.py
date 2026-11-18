@@ -1,8 +1,10 @@
+import os
+import threading
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from flask import current_app
-from pymongo import ASCENDING, TEXT, MongoClient, ReturnDocument
+from flask import current_app, g
+from pymongo import ASCENDING, TEXT, MongoClient, ReadPreference, ReturnDocument
 from pymongo.errors import ConnectionFailure
 
 from alerta.app import alarm_model
@@ -16,12 +18,32 @@ from .utils import Query
 # See https://github.com/MongoEngine/flask-mongoengine/blob/master/flask_mongoengine/__init__.py
 # See https://github.com/dcrosta/flask-pymongo/blob/master/flask_pymongo/__init__.py
 
+READ_PREFERENCES = {
+    'primary': ReadPreference.PRIMARY,
+    'primaryPreferred': ReadPreference.PRIMARY_PREFERRED,
+    'secondary': ReadPreference.SECONDARY,
+    'secondaryPreferred': ReadPreference.SECONDARY_PREFERRED,
+    'nearest': ReadPreference.NEAREST,
+}
+
 
 class Backend(Database):
+
+    # Client cache defaults. On the class because no __init__ runs (the backend is mixed into
+    # the `db` singleton by rebinding __class__); set per instance, one instance per process.
+    _client = None
+    _client_pid = None
+    _client_uri = None
+    _client_lock = threading.Lock()
 
     def create_engine(self, app, uri, dbname=None, schema=None, raise_on_error=True):
         self.uri = uri
         self.dbname = dbname
+
+        pref = app.config.get('DATABASE_READ_PREFERENCE') or 'primary'
+        if pref not in READ_PREFERENCES:
+            app.logger.warning(f'Unknown DATABASE_READ_PREFERENCE {pref!r}, falling back to primary')
+        self.read_preference = READ_PREFERENCES.get(pref, ReadPreference.PRIMARY)
 
         db = self.connect()
 
@@ -39,12 +61,55 @@ class Backend(Database):
                 raise
             app.logger.warning(e)
 
+    @property
+    def client(self):
+        """
+        The process-wide MongoClient, created lazily on first use.
+
+        pymongo is built around ONE client reused for the lifetime of the process: the client owns
+        the connection pool and the replica-set topology. Creating one per request rebuilt both on
+        every call (~3 new TCP connections per request, plus topology discovery on a replica set),
+        and -- because `client` used to be a plain attribute reassigned by every `connect()` on this
+        shared singleton -- two overlapping requests in a threaded worker made `close()` close the
+        wrong client, leaking the other one's pool and monitor threads for the life of the process.
+
+        Keyed by PID so that a client built in a preforking WSGI master (uWSGI without `lazy-apps`,
+        mod_wsgi daemon mode) is never inherited by a worker: pymongo warns that using a client
+        across a fork "may result in deadlock" and that it "must be created after any forking"
+        (pymongo/synchronous/topology.py). Each worker builds its own on first use.
+        """
+        pid = os.getpid()
+        if not self._client_is_current(pid):
+            with self._client_lock:
+                # re-check under the lock: another thread may have just built it
+                if not self._client_is_current(pid):
+                    stale, stale_pid = self._client, self._client_pid
+                    self._client = MongoClient(self.uri)
+                    self._client_pid = pid
+                    self._client_uri = self.uri
+                    if stale is not None and stale_pid == pid:
+                        # same process, different URI (app reconfigured): drop the old pool.
+                        # After a fork we must NOT touch the inherited client -- the parent's
+                        # monitor threads do not exist here and closing it can block.
+                        try:
+                            stale.close()
+                        except Exception:
+                            pass
+        return self._client
+
+    def _client_is_current(self, pid):
+        return (
+            self._client is not None
+            and self._client_pid == pid
+            and self._client_uri == self.uri
+        )
+
     def connect(self):
-        self.client = MongoClient(self.uri)
+        client = self.client
         if self.dbname:
-            return self.client[self.dbname]
+            return client[self.dbname]
         else:
-            return self.client.get_database()
+            return client.get_database()
 
     @staticmethod
     def _create_indexes(db):
@@ -97,8 +162,52 @@ class Backend(Database):
             return False
         return True
 
+    @property
+    def is_replica_alive(self):
+        if self.read_preference == ReadPreference.PRIMARY:
+            return True                 # feature off: nothing to be down
+        try:
+            # whether the driver currently sees a secondary to read from; on a standalone
+            # deployment this is empty, which is the honest answer (no offload happening)
+            return bool(self.client.secondaries)
+        except ConnectionFailure:
+            return False
+
+    def get_db(self, readonly=False):
+        # In Mongo the gate is per request, not per helper: inside a GET on the `api` blueprint
+        # any handle can be the read handle. The `readonly` argument is ignored.
+        db = super().get_db()
+        if self._use_replica():
+            return self.get_db_ro()
+        return db
+
+    def get_db_ro(self):
+        if 'db_ro' not in g:
+            g.db_ro = super().get_db().with_options(read_preference=self.read_preference)
+        return g.db_ro
+
+    def _use_replica(self):
+        return (
+            getattr(self, 'read_preference', ReadPreference.PRIMARY) != ReadPreference.PRIMARY
+            and self._is_read_request()
+        )
+
     def close(self, db):
-        self.client.close()
+        # No-op: the client is process-wide and reused across requests, so an app-context
+        # teardown must not close its pool. Closing it here is what leaked connections under
+        # concurrency -- see the `client` property.
+        pass
+
+    def close_ro(self, db):
+        pass  # it is a clone of the same MongoClient; nothing of its own to close
+
+    def disconnect(self):
+        """Close the process-wide client. For shutdown and tests, never per request."""
+        with self._client_lock:
+            client = self._client
+            self._client = self._client_pid = self._client_uri = None
+        if client is not None:
+            client.close()
 
     def destroy(self):
         db = self.connect()
@@ -1123,7 +1232,8 @@ class Backend(Database):
         query = {'$or': [{'key': key}, {'_id': key}]}
         if user:
             query['user'] = user
-        return self.get_db().keys.find_one(query)
+        # auth decision: must not be served by a lagging secondary
+        return self.get_db_primary().keys.find_one(query)
 
     # list
     def get_keys(self, query=None, page=None, page_size=None):
@@ -1199,7 +1309,8 @@ class Backend(Database):
         if not username:
             return
         query = {'$or': [{'login': username}, {'email': username}]}
-        return self.get_db().users.find_one(query)
+        # auth decision; also stops AUTH_PROXY re-creating an existing user on a stale miss
+        return self.get_db_primary().users.find_one(query)
 
     def get_user_by_email(self, email):
         if not email:
@@ -1378,7 +1489,8 @@ class Backend(Database):
                 scopes.extend(current_app.config['USER_DEFAULT_SCOPES'])
             if match in current_app.config['GUEST_ROLES']:
                 scopes.extend(current_app.config['GUEST_DEFAULT_SCOPES'])
-            response = self.get_db().perms.find_one({'match': match}, projection={'scopes': 1, '_id': 0})
+            # authz decision: must not be served by a lagging secondary
+            response = self.get_db_primary().perms.find_one({'match': match}, projection={'scopes': 1, '_id': 0})
             if response:
                 scopes.extend(response['scopes'])
         return sorted(set(scopes))
@@ -1423,7 +1535,8 @@ class Backend(Database):
 
         customers = []
         for match in [login] + matches:
-            for r in self.get_db().customers.find({'match': match}):
+            # customer scoping is an authz decision: pin it to the primary
+            for r in self.get_db_primary().customers.find({'match': match}):
                 customers.append(r['customer'])
 
         if customers:
