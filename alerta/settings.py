@@ -46,6 +46,10 @@ DATABASE_URL = MONGO_URI  # default: MongoDB
 DATABASE_NAME = MONGO_DATABASE or POSTGRES_DB
 DATABASE_RAISE_ON_ERROR = MONGO_RAISE_ON_ERROR  # True - terminate, False - ignore and continue
 DATABASE_SCHEMA = 'public'  # default: None to use default schema
+DATABASE_URL_RO = None      # Postgres: read-only replica DSN; None => use the primary (feature off)
+DATABASE_URL_RO_CONNECT_TIMEOUT = 2   # Postgres: max seconds to connect to the replica (fail-fast)
+DATABASE_URL_RO_RETRY_INTERVAL = 30   # Postgres: seconds before retrying the replica after a failure
+DATABASE_READ_PREFERENCE = 'primary'  # MongoDB: primary|primaryPreferred|secondary|secondaryPreferred|nearest
 
 # Search
 DEFAULT_FIELD = 'text'  # default field if no search prefix specified (Postgres only)

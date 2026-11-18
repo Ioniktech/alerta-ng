@@ -5,7 +5,7 @@ from collections import defaultdict, namedtuple
 from datetime import datetime
 
 import psycopg2
-from flask import current_app
+from flask import current_app, g
 from psycopg2 import sql
 from psycopg2.extensions import AsIs, adapt, register_adapter
 from psycopg2.extras import Json, NamedTupleCursor, register_composite
@@ -21,6 +21,17 @@ from alerta.utils.response import absolute_url
 from .utils import Query
 
 MAX_RETRIES = 5
+
+# errors on a replica connection that justify retrying the same query on the primary
+RO_RETRY_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError)
+
+# A recovery conflict reports 40001, or 40P01 for the buffer-deadlock case -- not 57014.
+# Matched by SQLSTATE and not by message, because messages are translated.
+RECOVERY_CONFLICT_SQLSTATES = ('40001', '40P01')
+
+# statement_timeout or a user cancel on a healthy replica: retrying on the primary would
+# move the shed load back onto the node this feature protects.
+QUERY_CANCELED_SQLSTATE = '57014'
 
 
 class HistoryAdapter:
@@ -66,6 +77,10 @@ class Backend(Database):
 
     def create_engine(self, app, uri, dbname=None, schema='public', raise_on_error=True):
         self.uri = uri
+        self.uri_ro = app.config.get('DATABASE_URL_RO') or uri   # fallback to primary => feature off
+        self.ro_connect_timeout = app.config.get('DATABASE_URL_RO_CONNECT_TIMEOUT', 2)
+        self.ro_retry_interval = app.config.get('DATABASE_URL_RO_RETRY_INTERVAL', 30)
+        self._replica_down_until = 0.0   # circuit breaker, per worker process
         self.dbname = dbname
         self.schema = schema
 
@@ -93,35 +108,83 @@ class Backend(Database):
         register_adapter(History, HistoryAdapter)
 
     def connect(self):
+        return self._connect(self.uri)
+
+    def connect_ro(self):
+        # fail-fast: a single attempt and a bounded connect timeout
+        return self._connect(self.uri_ro, readonly=True,
+                             max_retries=0, connect_timeout=self.ro_connect_timeout)
+
+    def _connect(self, uri, readonly=False, max_retries=MAX_RETRIES, connect_timeout=None):
         retry = 0
         while True:
             try:
+                kwargs = {'connect_timeout': connect_timeout} if connect_timeout is not None else {}
                 conn = psycopg2.connect(
-                    dsn=self.uri,
+                    dsn=uri,
                     dbname=self.dbname,
-                    cursor_factory=NamedTupleCursor
+                    cursor_factory=NamedTupleCursor,
+                    **kwargs
                 )
 
                 conn.autocommit = True
                 conn.set_client_encoding('UTF8')
                 break
             except Exception as e:
-                logging.getLogger('alerta.database').error('Database connection error: %s', e)
+                # the RO path falls back to the primary, so the request still succeeds:
+                # log it as a warning and leave ERROR for failures that break something
+                log = logging.getLogger('alerta.database')
+                (log.warning if readonly else log.error)('Database connection error: %s', e)
                 retry += 1
-                if retry > MAX_RETRIES:
+                if retry > max_retries:
                     conn = None
                     break
                 else:
                     backoff = 2 ** retry
-                    logging.getLogger('alerta.database').info('Retry attempt %d/%d (wait=%ds)...', retry, MAX_RETRIES, backoff)
+                    logging.getLogger('alerta.database').info('Retry attempt %d/%d (wait=%ds)...', retry, max_retries, backoff)
                     time.sleep(backoff)
 
         if conn:
-            conn.cursor().execute(sql.SQL('SET search_path TO {}').format(sql.Identifier(self.schema)))
-            conn.commit()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql.SQL('SET search_path TO {}').format(sql.Identifier(self.schema)))
+                if readonly:
+                    # safety belt: if a write sneaks in by mistake, Postgres rejects it
+                    cur.execute('SET SESSION default_transaction_read_only = on')
+                conn.commit()
+            except Exception:
+                # the connection is open but unusable: close it rather than leak the socket
+                conn.close()
+                raise
             return conn
         else:
-            raise RuntimeError(f'Database connect error. Failed to connect after {MAX_RETRIES} retries.')
+            raise RuntimeError(f'Database connect error. Failed to connect after {max_retries} retries.')
+
+    def _use_replica(self):
+        return (
+            self.uri_ro != self.uri                           # RO configured and different from primary
+            and time.monotonic() >= self._replica_down_until  # breaker closed
+            and self._is_read_request()                       # shared gate
+        )
+
+    def get_db_ro(self):
+        if 'db_ro' not in g:
+            try:
+                g.db_ro = self.connect_ro()
+            except Exception as e:
+                current_app.logger.warning(f'Read replica unavailable ({e}); falling back to primary')
+                self._trip_replica_breaker()
+                return self.get_db()      # FALLBACK: the primary serves this request
+        return g.db_ro
+
+    def _trip_replica_breaker(self):
+        self._replica_down_until = time.monotonic() + self.ro_retry_interval
+
+    def close_ro(self, db):
+        try:
+            self.close(db)
+        except Exception:
+            pass   # the RO connection may already be broken; it must not break teardown
 
     @staticmethod
     def _adapt_datetime(dt):
@@ -144,6 +207,20 @@ class Backend(Database):
         cursor = self.get_db().cursor()
         cursor.execute('SELECT true')
         return cursor.fetchone()
+
+    @property
+    def is_replica_alive(self):
+        if self.uri_ro == self.uri:
+            return True                 # no replica configured: nothing to be down
+        if time.monotonic() < self._replica_down_until:
+            return False                # breaker open: this worker is not offloading
+        try:
+            conn = self.connect_ro()
+        except Exception:
+            self._trip_replica_breaker()
+            return False
+        conn.close()
+        return True
 
     def close(self, db):
         db.close()
@@ -951,7 +1028,8 @@ class Backend(Database):
              WHERE (id=%(key)s OR key=%(key)s)
                AND {'"user"=%(user)s' if user else '1=1'}
         """
-        return self._fetchone(select, {'key': key, 'user': user})
+        # auth decision: must not be served by a lagging replica
+        return self._fetchone(select, {'key': key, 'user': user}, readonly=False)
 
     def get_keys(self, query=None, page=None, page_size=None):
         query = query or Query()
@@ -1051,7 +1129,8 @@ class Backend(Database):
 
     def get_user_by_username(self, username):
         select = """SELECT * FROM users WHERE login=%s OR email=%s"""
-        return self._fetchone(select, (username, username))
+        # auth decision; also stops AUTH_PROXY re-creating an existing user on a stale miss
+        return self._fetchone(select, (username, username), readonly=False)
 
     def get_user_by_email(self, email):
         select = """SELECT * FROM users WHERE email=%s"""
@@ -1288,7 +1367,8 @@ class Backend(Database):
             if match in current_app.config['GUEST_ROLES']:
                 scopes.extend(current_app.config['GUEST_DEFAULT_SCOPES'])
             select = """SELECT scopes FROM perms WHERE match=%s"""
-            response = self._fetchone(select, (match,))
+            # authz decision: must not be served by a lagging replica
+            response = self._fetchone(select, (match,), readonly=False)
             if response:
                 scopes.extend(response.scopes)
         return sorted(set(scopes))
@@ -1356,7 +1436,8 @@ class Backend(Database):
         customers = []
         for match in [login] + matches:
             select = """SELECT customer FROM customers WHERE match=%s"""
-            response = self._fetchall(select, (match,))
+            # customer scoping is an authz decision: pin it to the primary
+            response = self._fetchall(select, (match,), readonly=False)
             if response:
                 customers.extend([r.customer for r in response])
 
@@ -1546,25 +1627,62 @@ class Backend(Database):
         self.get_db().commit()
         return cursor.fetchone()
 
-    def _fetchone(self, query, vars):
-        """
-        Return none or one row.
-        """
-        cursor = self.get_db().cursor()
+    def _execute(self, conn, query, vars):
+        cursor = conn.cursor()
         self._log(cursor, query, vars)
         cursor.execute(query, vars)
-        return cursor.fetchone()
+        return cursor
 
-    def _fetchall(self, query, vars, limit=None, offset=0):
+    def _failover_to_primary(self, conn, exc):
+        """If `conn` was the replica, return the primary to retry on. Otherwise None."""
+        if conn is not g.get('db_ro'):
+            return None            # the failure came from the primary: behaviour unchanged
+        pgcode = getattr(exc, 'pgcode', None)
+        if pgcode in RECOVERY_CONFLICT_SQLSTATES:
+            # replica alive, recovery just cancelled this query: retry, breaker stays closed
+            current_app.logger.warning('Replica query cancelled by recovery conflict; retrying on primary')
+            return self.get_db()
+        if pgcode == QUERY_CANCELED_SQLSTATE:
+            # deliberate cancellation on a healthy replica: do not retry, do not trip
+            current_app.logger.warning('Replica query cancelled (statement_timeout or user request); not retrying')
+            return None
+        g.pop('db_ro', None)       # connection lost: drop the replica for the rest of the request
+        self.close_ro(conn)
+        self._trip_replica_breaker()
+        current_app.logger.warning('Read replica connection lost; retrying on primary')
+        return self.get_db()
+
+    def _fetchone(self, query, vars, readonly=True):
+        """
+        Return none or one row.
+
+        `readonly=False` pins the read to the primary; see `get_db_primary()`.
+        """
+        conn = self.get_db(readonly=readonly)
+        try:
+            return self._execute(conn, query, vars).fetchone()
+        except RO_RETRY_ERRORS as e:
+            primary = self._failover_to_primary(conn, e)
+            if primary is None:
+                raise
+            return self._execute(primary, query, vars).fetchone()
+
+    def _fetchall(self, query, vars, limit=None, offset=0, readonly=True):
         """
         Return multiple rows.
+
+        `readonly=False` pins the read to the primary; see `get_db_primary()`.
         """
         if limit is not None:
             query += f' LIMIT {limit} OFFSET {offset}'
-        cursor = self.get_db().cursor()
-        self._log(cursor, query, vars)
-        cursor.execute(query, vars)
-        return cursor.fetchall()
+        conn = self.get_db(readonly=readonly)
+        try:
+            return self._execute(conn, query, vars).fetchall()
+        except RO_RETRY_ERRORS as e:
+            primary = self._failover_to_primary(conn, e)
+            if primary is None:
+                raise
+            return self._execute(primary, query, vars).fetchall()
 
     def _updateone(self, query, vars, returning=False):
         """

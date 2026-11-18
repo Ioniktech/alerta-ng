@@ -3,7 +3,7 @@ from importlib.metadata import entry_points as _entry_points
 from typing import NamedTuple
 from urllib.parse import urlparse
 
-from flask import g
+from flask import g, has_request_context, request
 
 # http://stackoverflow.com/questions/8544983/dynamically-mixin-a-base-class-to-an-instance-in-python
 
@@ -87,21 +87,59 @@ class Database(Base):
     def is_alive(self):
         raise NotImplementedError
 
+    @property
+    def is_replica_alive(self):
+        """
+        Whether reads are currently being offloaded to a replica, per worker process.
+        True when no replica is configured, so "not offloading" never reads as a fault.
+        """
+        return True
+
     def close(self, db):
         raise NotImplementedError('Database engine has no close() method')
 
     def destroy(self):
         raise NotImplementedError('Database engine has no destroy() method')
 
-    def get_db(self):
+    def get_db(self, readonly=False):
+        if readonly and self._use_replica():
+            return self.get_db_ro()
+        return self.get_db_primary()
+
+    def get_db_primary(self):
+        """
+        The primary handle, never a replica, for reads that decide authentication or
+        authorization: a lagging replica would keep a revoked key or permission
+        working for the length of the replication delay.
+        """
         if 'db' not in g:
             g.db = self.connect()
         return g.db
 
+    def get_db_ro(self):
+        raise NotImplementedError('Database engine has no read-only connection')
+
+    def _use_replica(self):
+        return False  # backends with replica support override this
+
+    def _is_read_request(self):
+        """True if the in-flight request is a pure API read."""
+        return (
+            has_request_context()                  # there is a request (not housekeeping/CLI/startup)
+            and request.method in ('GET', 'HEAD')  # reads only
+            and request.blueprint == 'api'         # exclude 'webhooks'/'mgmt' (GETs that mutate)
+        )
+
     def teardown_db(self, exc):
+        db_ro = g.pop('db_ro', None)
+        if db_ro is not None:
+            self.close_ro(db_ro)
         db = g.pop('db', None)
         if db is not None:
             self.close(db)
+
+    def close_ro(self, db):
+        self.close(db)  # by default an RO connection is closed like any other
 
     # ALERTS
 

@@ -39,6 +39,10 @@ class Config:
         config['DATABASE_URL'] = get_config('DATABASE_URL', default=database_url, type=str, config=config)
         config['DATABASE_NAME'] = get_config('DATABASE_NAME', default=None, type=str, config=config)
         config['DATABASE_SCHEMA'] = get_config('DATABASE_SCHEMA', default='public', type=str, config=config)
+        config['DATABASE_URL_RO'] = get_config('DATABASE_URL_RO', default=None, type=str, config=config)
+        config['DATABASE_URL_RO_CONNECT_TIMEOUT'] = get_config('DATABASE_URL_RO_CONNECT_TIMEOUT', default=2, type=int, config=config)
+        config['DATABASE_URL_RO_RETRY_INTERVAL'] = get_config('DATABASE_URL_RO_RETRY_INTERVAL', default=30, type=int, config=config)
+        config['DATABASE_READ_PREFERENCE'] = get_config('DATABASE_READ_PREFERENCE', default='primary', type=str, config=config)
 
         config['AUTH_REQUIRED'] = get_config('AUTH_REQUIRED', default=None, type=bool, config=config)
         config['AUTH_PROVIDER'] = get_config('AUTH_PROVIDER', default=None, type=str, config=config)
